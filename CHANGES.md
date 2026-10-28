@@ -73,7 +73,7 @@ Repository history used as the starting point: `547998b` (after the two commits 
 |---|---|---|
 | `DATABASE_URL` | required, from `.env` | required, from the platform's Variables tab |
 | `HOST` | optional, defaults to `127.0.0.1` | set `0.0.0.0` |
-| `PORT` | optional, defaults to `8080` | leave unset; the platform injects it |
+| `PORT` | optional, defaults to `8080` | set `3000` to match the Nixpacks exposed port |
 
 `.env` stays gitignored. Never commit real credentials.
 
@@ -111,3 +111,50 @@ first deploy.
 | No request logging | `server.js` | Only errors are logged; no request ids or latency. |
 | No favicon | `server.js` | `GET /favicon.ico` returns 404, which is harmless. |
 | Open to anyone with the link | by design | Decision taken during planning; add auth if that changes. |
+
+---
+
+## Deployment record (selfhost.dev)
+
+Where it runs and how it is wired, so the next person does not have to rediscover it.
+
+| Item | Value |
+|---|---|
+| Project | `link drop from fork` (`prj_01m60w6atrpd01808z7a9k8b4h`) |
+| App / deployment | `cosmicAP/linkdrop`, branch `main`, Nixpacks, port `3000` (`deploy_01m60zxgntgdca916ttgehfa6w`) |
+| Live URL | https://linkdrop-66e95219.49.12.110.255.nip.swatantra.cloud |
+| Database | project Postgres `linkdrop-db`, private (no public port), db `linkdrop`, user `linkdrop` |
+| Env vars | `DATABASE_URL` (internal container hostname, not `localhost`), `HOST=0.0.0.0`, `PORT=3000` |
+
+### The two failures that cost the most time
+
+1. **`DATABASE_URL` pointed at `localhost:5432/linkdrop`.** It had been copied from
+   `.env.example`, and a project database is a *separate container* with its own internal
+   hostname. The app booted, logged `database target: localhost:5432/linkdrop`, failed
+   `ensureSchema()`, and then crash-looped, so the proxy answered `502`.
+   The internal hostname is printed in the database container log header
+   (`== /<hostname> ==`); the MCP API deliberately never returns database passwords.
+2. **Port mismatch: container listening on one port, proxy configured for another.**
+   Nixpacks detects and exposes `3000` for a Node app, while the app defaulted to `8080`.
+   The build log states it plainly:
+   `Warning: PORT environment variable (3000) does not match configured ports_exposes: 8080.`
+   That produces `502 Bad Gateway` or `503 no available server` even though the container is
+   healthy and logging `listening on 0.0.0.0:...`. Fix: make both sides agree — here by
+   setting `PORT=3000` and the deployment port to `3000`.
+
+### Startup logging added because of (1)
+
+`start()` now prints the redacted database target and whether `ensureSchema()` succeeded, and
+**keeps serving** if the database is unreachable. Before this, a bad `DATABASE_URL` exited the
+process with one line that the platform did not surface, which looked identical to a port
+problem.
+
+### Verified live after the fix
+
+- `GET /healthz` → `200 ok` (also re-checked after a redeploy)
+- `GET /` → `200`, renders the list
+- `POST /links` → `303` to `/`, row appears on the page
+- `javascript:` URL → `400`, cross-origin post → `403`, JSON body → `415`
+- a note containing `<script>` renders escaped
+- `GET /?ref=hn` → `200`
+- links persisted across a fresh deploy

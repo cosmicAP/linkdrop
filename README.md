@@ -59,7 +59,18 @@ The app is stateless and has no build step, so any Node host works. It needs:
 2. Add a PostgreSQL service to the project and note its connection details.
 3. Add the GitHub repo as an app, enable auto-deploy, use the Nixpacks build pack.
 4. In the app's Variables tab set `DATABASE_URL` (from step 2) and `HOST=0.0.0.0`.
-5. Deploy, then check `/healthz` and post a link.
+5. Make the app port and the platform port agree, or you will get `502`/`503` from the proxy
+   while the container itself looks healthy. Nixpacks exposes `3000` for Node, so either set
+   `PORT=3000` or set the app's port to `8080`.
+6. Deploy, then check `/healthz` and post a link.
+
+Two things that are easy to get wrong:
+
+- **`DATABASE_URL` must use the database container's internal hostname**, not `localhost`.
+  A project database is a separate container; `localhost:5432` refers to the app container.
+  The hostname appears in the database container logs (`== /<hostname> ==`).
+- Environment changes restart the container, but the proxy only picks up a changed port after
+  the next deploy.
 
 Custom domains and TLS are handled by the platform. Stop the project when you are done testing;
 billing is per hour.
