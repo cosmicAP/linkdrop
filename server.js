@@ -195,6 +195,15 @@ const server = http.createServer(async (req, res) => {
       return res.end();
     }
 
+    // TEMPORARY: one-off cleanup of demo rows. Removed in the follow-up commit.
+    if (req.method === 'POST' && pathname === '/__purge' && process.env.PURGE_TOKEN) {
+      if (req.headers['x-purge-token'] !== process.env.PURGE_TOKEN) {
+        return send(req, res, 403, 'text/plain; charset=utf-8', 'Forbidden');
+      }
+      const result = await pool.query('DELETE FROM links');
+      return send(req, res, 200, 'text/plain; charset=utf-8', `deleted ${result.rowCount}`);
+    }
+
     return send(req, res, 404, 'text/plain; charset=utf-8', 'Not found');
   } catch (err) {
     if (res.headersSent) {
