@@ -219,18 +219,33 @@ async function ensureSchema() {
   await pool.query(sql);
 }
 
+function describeDatabase(raw) {
+  try {
+    const url = new URL(raw);
+    return `${url.hostname}:${url.port || '5432'}${url.pathname}`;
+  } catch {
+    return '(unparseable DATABASE_URL)';
+  }
+}
+
 async function start() {
+  console.log(`starting linkdrop on ${config.host}:${config.port}`);
+
   if (!config.databaseUrl) {
-    console.error('DATABASE_URL is not set. Copy .env.example to .env and fill it in.');
-    process.exit(1);
+    console.error('DATABASE_URL is not set; the app will start but database calls will fail.');
+  } else {
+    console.log(`database target: ${describeDatabase(config.databaseUrl)}`);
+    try {
+      await ensureSchema();
+      console.log('database schema ready');
+    } catch (err) {
+      console.error('Could not prepare the database schema:', err.message);
+    }
   }
 
-  try {
-    await ensureSchema();
-  } catch (err) {
-    console.error('Could not prepare the database schema:', err.message);
-    process.exit(1);
-  }
+  server.on('error', (err) => {
+    console.error('server error:', err.message);
+  });
 
   server.listen(config.port, config.host, () => {
     console.log(`linkdrop listening on http://${config.host}:${config.port}`);
