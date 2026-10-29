@@ -34,7 +34,7 @@ Repository history used as the starting point: `547998b` (after the two commits 
 | `render()` | `<time datetime="...">` added; visible `<label>` elements; `maxlength` on both fields. | Accessibility and defence in depth (placeholders are not labels). |
 | `listLinks()` | `ORDER BY created_at` → `ORDER BY created_at DESC, id DESC`. | The page claimed "20 newest" but returned the 20 **oldest**, so new links never appeared after 20 rows. `id` breaks timestamp ties. |
 | `readBody()` | `req.setEncoding('utf8')`, byte-based size counting, settle-once guard, rejects with status 413 instead of `req.destroy()`. | `destroy()` left the promise pending forever (hung request); counting UTF-16 units corrupted multi-byte characters split across chunks. |
-| `isSameOrigin()` | New; rejects `POST /links` when `Origin`/`Referer` is a different host. | Cross-site form posts could inject spam links. Requests without the headers (curl) still work. |
+| `isSameOrigin()` | New; rejects `POST /links` when `Origin`/`Referer` is a different host. Requests without the headers (curl) still work. **Superseded — see "Follow-up: 403 on every post" below.** | Cross-site form posts could inject spam links. |
 | Content-Type check | `POST /links` requires `application/x-www-form-urlencoded`, otherwise `415`. | Stopped JSON/multipart bodies being parsed as form data and silently inserted as garbage. |
 | Routing | Parse `pathname` from `req.url`; support `HEAD` alongside `GET`. | `/?ref=x` used to 404; uptime monitors often probe with `HEAD`. |
 | `/healthz` | Runs `SELECT 1`; returns `503` when the database is down. | Previously reported `ok` with a dead database, so load balancers kept sending traffic. |
@@ -158,3 +158,39 @@ problem.
 - a note containing `<script>` renders escaped
 - `GET /?ref=hn` → `200`
 - links persisted across a fresh deploy
+
+---
+
+## Follow-up: 403 on every post (2026-10-29)
+
+**Symptom:** submitting any link on the live deployment returned
+`403 Cross-origin posts are not allowed.` The link itself was irrelevant — the guard runs
+before `safeUrl()` and never reads the body.
+
+**Cause:** `isSameOrigin()` compared the browser's `Origin` host to `req.headers.host`,
+assuming both see the same address. That holds on `localhost` and breaks in front of a
+reverse proxy, and `Origin: null` (opaque origin) threw inside `new URL()` and was rejected.
+Reproduced against the live URL: a matching `Origin` reached URL validation (`400`), while
+`Origin: null` returned `403`.
+
+**Fix (`server.js`):**
+
+- `Sec-Fetch-Site` is consulted first. The browser sets it, proxies cannot rewrite it;
+  `same-origin` and `none` pass, `cross-site` is rejected.
+- The host comparison uses `x-forwarded-host` when present, falling back to `host`.
+- `Origin: null` and unparseable origins are treated as same-origin. The app has no cookies
+  or credentials, so the guard is spam deterrent only and must fail open for real users.
+- Requests with no `Origin`/`Referer` (curl, uptime checks) still pass unchanged.
+
+**Verified locally** against a real PostgreSQL 14 cluster (no stubs):
+
+| Request | Result |
+|---|---|
+| normal same-origin | `400` (Guard passes; `javascript:` rejected later) |
+| `Origin: null` | `400` (previously `403`) |
+| `Sec-Fetch-Site: cross-site` | `403` |
+| cross-site `Origin` only | `403` |
+| `Host` rewritten + `X-Forwarded-Host` | `400` (previously `403`) |
+| no `Origin` (curl) | `400` |
+| real YouTube URL, same origin | `303`, row stored |
+| `HEAD /healthz` | `200` |

@@ -130,13 +130,33 @@ function readBody(req) {
 // Browsers send Origin/Referer on form posts. Reject cross-site ones so third
 // party pages cannot inject links. Non-browser clients without the headers
 // (curl, health checks) are unaffected.
+//
+// This must not trust req.headers.host: behind a reverse proxy that is the
+// internal address (localhost:3000), not the address the browser used, which
+// made every legitimate post fail with 403 in production. Prefer the browser's
+// own Sec-Fetch-Site verdict, which proxies cannot rewrite.
 function isSameOrigin(req) {
+  const site = req.headers['sec-fetch-site'];
+  if (site) return site === 'same-origin' || site === 'none';
+
   const source = req.headers.origin || req.headers.referer;
+  // No headers at all: curl, uptime checks, old browsers.
   if (!source) return true;
+  // "null" is an opaque origin (sandboxed frame, file://, redirected post).
+  // There is nothing to compare it to, and this app has no cookies or
+  // credentials to protect, so treat it as same-origin rather than locking
+  // real users out of their own page.
+  if (source === 'null') return true;
+
   try {
-    return new URL(source).host === req.headers.host;
+    const origin = new URL(source);
+    const forwardedHost = req.headers['x-forwarded-host'];
+    const host = String(forwardedHost || req.headers.host || '')
+      .split(',')[0]
+      .trim();
+    return origin.host === host;
   } catch {
-    return false;
+    return true;
   }
 }
 
