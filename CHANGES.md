@@ -30,19 +30,20 @@ Repository history used as the starting point: `547998b` (after the two commits 
 | Area | Change | Why |
 |---|---|---|
 | `escapeHtml()` | New helper; `url`, `note` and the `href` are escaped before rendering. | Stored XSS: a posted note could inject `<script>` that ran for every visitor. |
-| `safeUrl()` | New helper; only absolute `http:`/`https:` URLs are accepted, max 2048 chars. | Blocked `javascript:`, `data:` and attribute-breakout payloads; the old check was `if (!url)`. |
+| `safeUrl()` | New helper; only absolute `http:`/`https:` URLs are accepted, no embedded credentials, max 2048 chars. | Blocked `javascript:`, `data:` and attribute-breakout payloads; the old check was `if (!url)`. `https://trusted.com@evil.example` is a phishing shape and is now rejected. |
 | `render()` | `<time datetime="...">` added; visible `<label>` elements; `maxlength` on both fields. | Accessibility and defence in depth (placeholders are not labels). |
 | `listLinks()` | `ORDER BY created_at` → `ORDER BY created_at DESC, id DESC`. | The page claimed "20 newest" but returned the 20 **oldest**, so new links never appeared after 20 rows. `id` breaks timestamp ties. |
 | `readBody()` | `req.setEncoding('utf8')`, byte-based size counting, settle-once guard, rejects with status 413 instead of `req.destroy()`. | `destroy()` left the promise pending forever (hung request); counting UTF-16 units corrupted multi-byte characters split across chunks. |
 | `isSameOrigin()` | New; rejects `POST /links` when `Origin`/`Referer` is a different host. Requests without the headers (curl) still work. **Superseded — see "Follow-up: 403 on every post" below.** | Cross-site form posts could inject spam links. |
 | Content-Type check | `POST /links` requires `application/x-www-form-urlencoded`, otherwise `415`. | Stopped JSON/multipart bodies being parsed as form data and silently inserted as garbage. |
 | Routing | Parse `pathname` from `req.url`; support `HEAD` alongside `GET`. | `/?ref=x` used to 404; uptime monitors often probe with `HEAD`. |
-| `/healthz` | Runs `SELECT 1`; returns `503` when the database is down. | Previously reported `ok` with a dead database, so load balancers kept sending traffic. |
+| `/healthz` | Runs `SELECT 1` and checks that the schema was applied; returns `503` (with `Retry-After`) when either is false. | Previously reported `ok` with a dead database, so load balancers kept sending traffic. A database that is reachable but missing the table is just as unusable. |
 | Security headers | `Content-Security-Policy`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`; `Cache-Control: no-store` on `/`. | Mitigates XSS and stale HTML being cached by proxies. |
 | Error handler | Guards on `res.headersSent`; maps oversized bodies to `413`. | Avoided `ERR_HTTP_HEADERS_SENT` when an error happened after headers were written. |
 | `pool` | Added `statement_timeout: 5s`, `idleTimeoutMillis: 30s`, and a `pool.on('error')` listener. | A dropped idle connection used to crash the process with an uncaught exception. |
 | `ensureSchema()` | Runs `db/schema.sql` on boot before listening. | PaaS gives no easy shell to apply the schema, so first deploys failed with `relation "links" does not exist`. The SQL is idempotent. |
-| `start()` | Fails fast (exit 1, clear message) when `DATABASE_URL` is missing or the schema cannot be applied. | Previously the process started "healthy" and 500'd on every request. |
+| `start()` / `ensureSchema()` | Logs the redacted database target and whether `ensureSchema()` succeeded, then **keeps serving**; `/healthz` stays `503` until the schema is ready. A failed `listen` (e.g. `EADDRINUSE`) now exits non-zero. | Exiting on a schema error hid the cause behind an old log buffer and looked like a proxy fault; staying up with a truthful readiness signal makes the failure visible. A process that cannot bind serves nothing, so it must not keep running. |
+| `test/`, `npm test` | 26 behavioural tests: a throwaway PostgreSQL cluster plus the real `node server.js` process, driven over HTTP. | The previous verification was a stubbed pool that never executed a query. Bugs in readiness, ordering and proxying only appear against a real database and a real socket. |
 | Timeouts | `server.requestTimeout = 15s`, `server.headersTimeout = 10s`. | Basic slowloris protection; a client could otherwise hold a connection open indefinitely. |
 | Shutdown | Handles `SIGINT` as well as `SIGTERM`; closes idle connections; force-closes after 10s. | Keep-alive connections could hold `server.close()` open until the orchestrator SIGKILLed the deploy. |
 
@@ -81,22 +82,28 @@ Repository history used as the starting point: `547998b` (after the two commits 
 
 ## Verified
 
-- `node --check server.js` and `node --check config.js` pass.
-- An ad-hoc HTTP smoke test was run with a stubbed `pg` pool (no database required), 14
-  assertions, all passing:
-  - `GET /healthz` → `200 ok`
-  - `GET /` renders, escapes `<script>` in a note, emits `href` and `<time datetime>`
-  - `GET /?ref=hn` → `200` (query string no longer 404s)
-  - `HEAD /` → `200`, `GET /favicon.ico` → `404`, `GET /nope` → `404`
-  - `POST /links` valid → `303` to `/`
-  - `POST /links` with `javascript:` → `400`
-  - `POST /links` cross-origin → `403`
-  - `POST /links` as JSON → `415`
-  - `POST /links` over 10 KB → `413` (and no stack trace logged)
+`npm test` runs the suite in `test/` against a **real PostgreSQL 14 cluster** that the helper
+starts in a temp directory (`initdb` + `postgres`, trust auth, random port) and against the app
+spawned as a real `node server.js` child process — no stubbed pool, no mocked routes. 27 tests,
+all passing:
 
-Not verified locally: no PostgreSQL server is installed on this machine, so real queries and
-the boot-time schema creation were not exercised. The first real check is `/healthz` after the
-first deploy.
+- readiness: `200 ok` when the database and schema are ready; `503` when the database is
+  unreachable **or** the schema could not be applied; a normal page in that state returns `500`
+- routing: `GET /` and `GET /?ref=hn` → `200`; `HEAD /` → empty body; unknown paths and
+  unsupported methods → `404`
+- posting: valid form → `303` with the row visible; `javascript:`/`data:`/`ftp:`/relative/blank
+  → `400`; embedded credentials → `400`; over 2048 chars → `400`; cross-origin → `403`;
+  `Sec-Fetch-Site: cross-site`/`same-site` → `403`; opaque `Origin: null` → `303`;
+  `X-Forwarded-Host` proxy case → `303`, missing forwarded host → `403`; JSON or missing
+  content type → `415`; body over 10 KB → `413` without hanging
+- output: `<script>` in a note is escaped, `&` in a URL is escaped, multi-byte notes round-trip
+- data: newest 20, newest first; equal timestamps break by `id`; table created on boot;
+  rows survive a process restart
+- headers: CSP, `nosniff` and `no-referrer` on every response
+- process: a port that is already in use exits non-zero instead of idling
+
+`node --check server.js` and `node --check config.js` pass. `npm audit --omit=dev` reports
+0 vulnerabilities.
 
 ---
 
@@ -105,9 +112,8 @@ first deploy.
 | Issue | Where | Notes |
 |---|---|---|
 | No pagination | `server.js` `listLinks()` | Only the newest 20 are visible; add `?before=` if the list grows. |
-| No rate limiting | `server.js` `POST /links` | A public URL can still be spammed with rows. |
+| No rate limiting | `server.js` `POST /links` | A public URL can still be spammed with rows. Needs a shared store once more than one instance serves traffic. |
 | `pg` SSL not configured | `server.js` pool | Fine for a same-host private database; add `?sslmode=require` if the provider requires TLS. |
-| No tests | repo root | `node:test` cases for `render`, `safeUrl` and `readBody` would be cheap. |
 | No request logging | `server.js` | Only errors are logged; no request ids or latency. |
 | No favicon | `server.js` | `GET /favicon.ico` returns 404, which is harmless. |
 | Open to anyone with the link | by design | Decision taken during planning; add auth if that changes. |

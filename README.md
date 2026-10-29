@@ -40,9 +40,28 @@ the template to copy.
 
 ## Health check
 
-`GET /healthz` returns `200 ok` only when the process is up **and** the database answers
-`SELECT 1`. It returns `503` if the database is unreachable, so a load balancer stops routing
-traffic to a broken instance.
+`GET /healthz` returns `200 ok` only when the process is up, the database answers `SELECT 1`,
+**and** the `links` table exists. It returns `503` (with `Retry-After`) otherwise, so a load
+balancer stops routing traffic to an instance that cannot serve.
+
+## Tests
+
+```bash
+npm test
+```
+
+The suite starts a throwaway PostgreSQL cluster (`initdb` + `postgres`, trust auth, random
+port, temp directory), boots the app as a real child process, and drives it over HTTP. Nothing
+is mocked and no external service is required.
+
+Requirements: PostgreSQL 14+ server binaries (`initdb`, `postgres`). They are looked up on
+`PATH`, then under `/usr/lib/postgresql/*/bin`. To use an existing disposable database instead:
+
+```bash
+TEST_DATABASE_URL=postgresql://user:pass@127.0.0.1:5432/linkdrop_test npm test
+```
+
+The suite truncates `links` before each case — never point `TEST_DATABASE_URL` at real data.
 
 ## Deploying
 
