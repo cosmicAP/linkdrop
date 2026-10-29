@@ -8,6 +8,11 @@ const MAX_BODY_BYTES = 10_000;
 const MAX_URL_LENGTH = 2_048;
 const MAX_NOTE_LENGTH = 2_000;
 
+// Readiness is "the database answers AND the schema is applied". Without the
+// second half the app returns 500 on every page while claiming to be healthy,
+// which is the failure mode the health check exists to prevent.
+let schemaReady = false;
+
 const pool = new Pool({
   connectionString: config.databaseUrl,
   max: 5,
@@ -30,13 +35,16 @@ function escapeHtml(value) {
 }
 
 // Only absolute http(s) URLs are allowed, so stored links can never be
-// javascript:, data: or anything else that runs in the page.
+// javascript:, data: or anything else that runs in the page. Credentials in
+// the URL (https://trusted.com@evil.example) are rejected: they are a
+// phishing shape, not a reading-list link.
 function safeUrl(raw) {
   const value = (raw || '').trim();
   if (!value || value.length > MAX_URL_LENGTH) return null;
   try {
     const url = new URL(value);
     if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+    if (url.username || url.password) return null;
     return url.href.length > MAX_URL_LENGTH ? null : url.href;
   } catch {
     return null;
@@ -165,6 +173,14 @@ function send(req, res, status, contentType, body, extraHeaders = {}) {
   res.end(req.method === 'HEAD' ? undefined : body);
 }
 
+// 503 means "try again later": the process is fine but a dependency is not.
+function unavailable(req, res) {
+  return send(req, res, 503, 'text/plain; charset=utf-8', 'unavailable', {
+    'cache-control': 'no-store',
+    'retry-after': '5',
+  });
+}
+
 const server = http.createServer(async (req, res) => {
   res.setHeader('x-content-type-options', 'nosniff');
   res.setHeader('referrer-policy', 'no-referrer');
@@ -180,9 +196,17 @@ const server = http.createServer(async (req, res) => {
     const isRead = req.method === 'GET' || req.method === 'HEAD';
 
     if (isRead && pathname === '/healthz') {
-      // Only report healthy when the database actually answers.
-      await pool.query('SELECT 1');
-      return send(req, res, 200, 'text/plain; charset=utf-8', 'ok');
+      // Only report healthy when the database answers and the schema is in place.
+      if (!schemaReady) return unavailable(req, res);
+      try {
+        await pool.query('SELECT 1');
+      } catch (err) {
+        console.error('health check failed:', err.message);
+        return unavailable(req, res);
+      }
+      return send(req, res, 200, 'text/plain; charset=utf-8', 'ok', {
+        'cache-control': 'no-store',
+      });
     }
 
     if (isRead && pathname === '/') {
@@ -257,6 +281,7 @@ async function start() {
     console.log(`database target: ${describeDatabase(config.databaseUrl)}`);
     try {
       await ensureSchema();
+      schemaReady = true;
       console.log('database schema ready');
     } catch (err) {
       console.error('Could not prepare the database schema:', err.message);
@@ -264,7 +289,10 @@ async function start() {
   }
 
   server.on('error', (err) => {
+    // A bind failure (EADDRINUSE, EACCES) cannot be recovered from: staying up
+    // would leave a process the platform calls "running" that serves nothing.
     console.error('server error:', err.message);
+    process.exit(1);
   });
 
   server.listen(config.port, config.host, () => {
